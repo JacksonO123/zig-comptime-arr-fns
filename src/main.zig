@@ -6,17 +6,19 @@ const ActionTypes = enum {
 
     map,
     for_each,
+    filter,
 
     fn to_string(self: Self) []const u8 {
         return switch (self) {
             .map => "map",
             .for_each => "for_each",
+            .filter => "filter",
         };
     }
 
     fn requires_allocation(self: Self) bool {
         return switch (self) {
-            .map => true,
+            .map, .filter => true,
             .for_each => false,
         };
     }
@@ -38,10 +40,13 @@ const ActionTypes = enum {
     fn allow_next_action(self: Self, next: Self) bool {
         return switch (self) {
             .map => switch (next) {
-                .map, .for_each => true,
+                .map, .for_each, .filter => true,
             },
             .for_each => switch (next) {
-                .map, .for_each => false,
+                .map, .for_each, .filter => false,
+            },
+            .filter => switch (next) {
+                .map, .for_each, .filter => true,
             },
         };
     }
@@ -57,6 +62,10 @@ fn ArrHandler(comptime T: type) type {
 
         pub fn map(comptime Ret: type, comptime callback: fn (comptime type, comptime T: type, T) Ret) type {
             return ActionWrapper(action_description_from(Ret, callback, .map, T));
+        }
+
+        pub fn filter(comptime callback: fn (comptime T: type, T) bool) type {
+            return ActionWrapper(action_description_from(T, callback, .filter, T));
         }
     };
 }
@@ -88,12 +97,19 @@ fn action_description_from(
     );
 }
 
+fn get_action_result_type_single(comptime T: type) type {
+    const action_struct = @FieldType(T, "action");
+    return if (@hasField(action_struct, "map") or @hasField(action_struct, "filter"))
+        @FieldType(T, "ret_type")
+    else
+        void;
+}
+
 fn get_action_result_type(comptime T: type) type {
     const next_action = @FieldType(T, "next_action");
     if (next_action != @TypeOf(null)) return get_action_result_type(next_action);
 
-    const action_struct = @FieldType(T, "action");
-    return if (@hasField(action_struct, "map")) @FieldType(T, "ret_type") else void;
+    return get_action_result_type_single(T);
 }
 
 fn get_action_fn_type(comptime T: type) type {
@@ -104,6 +120,8 @@ fn get_action_fn_type(comptime T: type) type {
         @field(inst, "map")
     else if (@hasField(action_struct, "for_each"))
         @field(inst, "for_each")
+    else if (@hasField(action_struct, "filter"))
+        @field(inst, "filter")
     else
         @compileError("Expected a valid arr action");
 
@@ -112,28 +130,39 @@ fn get_action_fn_type(comptime T: type) type {
 
 fn get_action_fn(comptime T: type) get_action_fn_type(T) {}
 
-fn handle_action_results(comptime T: type, comptime K: type, item: K) get_action_result_type(T) {
-    const res_value = a: {
+fn handle_action_results(
+    comptime T: type,
+    comptime K: type,
+    item: K,
+) struct { get_action_result_type(T), bool } {
+    const res_type = get_action_result_type_single(T);
+    const res_value: res_type, const keep_item: bool = a: {
         const action_struct = @FieldType(T, "action");
         const inst: action_struct = .{};
 
-        break :a if (@hasField(action_struct, "map")) b: {
+        if (@hasField(action_struct, "map")) {
             const action = @field(inst, "map");
             const ret_type = @FieldType(T, "ret_type");
             const res_value = action(ret_type, K, item);
-            break :b res_value;
+            break :a .{ if (res_type == void) undefined else res_value, true };
         } else if (@hasField(action_struct, "for_each")) {
             const action = @field(inst, "for_each");
             action(K, item);
+            break :a .{ undefined, true };
+        } else if (@hasField(action_struct, "filter")) {
+            const action = @field(inst, "filter");
+            const keep_item = action(K, item);
+            break :a .{ item, keep_item };
         } else {
             @compileError("Expected a valid arr action");
-        };
+        }
     };
 
     const next_action = @FieldType(T, "next_action");
-    if (next_action == @TypeOf(null)) return res_value;
+    if (!keep_item) return .{ undefined, keep_item };
+    if (next_action == @TypeOf(null)) return .{ res_value, keep_item };
 
-    return handle_action_results(next_action, @TypeOf(res_value), res_value);
+    return handle_action_results(next_action, res_type, res_value);
 }
 
 fn append_to_action_impl(
@@ -197,16 +226,32 @@ fn ActionWrapper(comptime T: type) type {
             data: []const @FieldType(T, "original_type"),
         ) ![]@FieldType(T, "original_type") {
             const res_type = @FieldType(T, "original_type");
-            var map_result = try allocator.alloc(res_type, data.len);
+            var result_buf = try allocator.alloc(res_type, data.len);
+            var index: usize = 0;
+            var was_filtered = false;
 
-            for (data, 0..) |item, index| {
-                const res = handle_action_results(T, res_type, item);
-                if (@TypeOf(res) != void) {
-                    map_result[index] = res;
+            for (data) |item| {
+                const res, const keep_item = handle_action_results(T, res_type, item);
+                if (!keep_item) {
+                    was_filtered = true;
+                    continue;
                 }
+
+                if (@TypeOf(res) != void) {
+                    result_buf[index] = res;
+                }
+
+                index += 1;
             }
 
-            return map_result;
+            if (was_filtered) {
+                const new_buf = try allocator.alloc(res_type, index);
+                @memcpy(new_buf, result_buf[0..index]);
+                allocator.free(result_buf);
+                return new_buf;
+            }
+
+            return result_buf;
         }
 
         pub fn for_each(comptime callback: fn (comptime T: type, T) void) type {
@@ -220,23 +265,39 @@ fn ActionWrapper(comptime T: type) type {
             const new_desc = action_description_from(Ret, callback, .map, original_type);
             return append_to_action(T, new_desc, .map, original_type);
         }
+
+        pub fn filter(comptime callback: fn (comptime T: type, T) bool) type {
+            const original_type = @FieldType(T, "original_type");
+            const current_res_type = get_action_result_type(T);
+            const new_desc = action_description_from(current_res_type, callback, .filter, original_type);
+            return append_to_action(T, new_desc, .filter, original_type);
+        }
     };
 }
 
 pub fn main(init: std.process.Init) !void {
     const arr = &.{ 1, 2, 3, 4, 5 };
 
-    _ = try ArrHandler(u32).map(u32, struct {
-        fn callback(comptime Ret: type, comptime T: type, item: T) Ret {
-            return item + 1;
-        }
-    }.callback).map(u32, struct {
-        fn callback(comptime Ret: type, comptime T: type, item: T) Ret {
-            return item + 1;
-        }
-    }.callback).for_each(struct {
-        fn callback(comptime T: type, item: T) void {
-            std.debug.print(":: {}\n", .{item});
-        }
-    }.callback).result(init.arena.allocator(), arr);
+    _ = try ArrHandler(u32)
+        .map(u32, struct {
+            fn callback(comptime Ret: type, comptime T: type, item: T) Ret {
+                return item + 1;
+            }
+        }.callback)
+        .map(u32, struct {
+            fn callback(comptime Ret: type, comptime T: type, item: T) Ret {
+                return item + 1;
+            }
+        }.callback)
+        .filter(struct {
+            fn callback(comptime T: type, item: T) bool {
+                return item % 2 == 0;
+            }
+        }.callback)
+        .for_each(struct {
+            fn callback(comptime T: type, item: T) void {
+                std.debug.print(":: {any}\n", .{item});
+            }
+        }.callback)
+        .result(init.arena.allocator(), arr);
 }
