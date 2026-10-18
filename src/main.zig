@@ -1,6 +1,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const ActionTypes = enum {
+    map,
+};
+
 fn ArrHandler(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -84,12 +88,18 @@ fn handle_action_results(comptime T: type, comptime K: type, item: K) get_action
     return handle_action_results(next_action, @TypeOf(res_value), res_value);
 }
 
-fn append_to_action(comptime T: type, comptime new_desc: type) type {
+fn append_to_action(comptime T: type, comptime new_desc: type, comptime action_type: ActionTypes) type {
     const current_info = @typeInfo(T).@"struct";
 
     var field_names: [current_info.fields.len][]const u8 = undefined;
     var field_types: [current_info.fields.len]type = undefined;
     var field_attributes: [current_info.fields.len]std.builtin.Type.StructField.Attributes = undefined;
+
+    const src_action = @FieldType(T, "action");
+    const valid = switch (action_type) {
+        .map => @hasField(src_action, "map"),
+    };
+    if (!valid) @compileError("Invalid action order");
 
     for (current_info.fields, 0..) |field, index| {
         field_names[index] = field.name;
@@ -117,33 +127,37 @@ fn append_to_action(comptime T: type, comptime new_desc: type) type {
 
 fn ActionWrapper(comptime T: type) type {
     return struct {
-        fn result(comptime K: type, data: []const K) void {
-            for (data) |item| {
-                const new_val = handle_action_results(T, K, item);
+        fn result(comptime K: type, allocator: Allocator, data: []const K) ![]K {
+            var map_result = try allocator.alloc(K, data.len);
 
-                std.debug.print(":: {}\n", .{new_val});
+            for (data, 0..) |item, index| {
+                map_result[index] = handle_action_results(T, K, item);
             }
+
+            return map_result;
         }
 
         fn map(comptime Ret: type, comptime callback: fn (comptime type, comptime T: type, T) Ret) type {
             const new_desc = action_description_from(Ret, callback);
-            return append_to_action(T, new_desc);
+            return append_to_action(T, new_desc, .map);
         }
     };
 }
 
 pub fn main(init: std.process.Init) !void {
-    _ = init;
-
     const arr = &.{ 1, 2, 3, 4, 5 };
 
-    ArrHandler(u32).map(u32, struct {
+    const res = try ArrHandler(u32).map(u32, struct {
         fn callback(comptime Ret: type, comptime T: type, item: T) Ret {
             return item + 1;
         }
-    }.callback).map(f32, struct {
+    }.callback).map(u32, struct {
         fn callback(comptime Ret: type, comptime T: type, item: T) Ret {
-            return @floatFromInt(item / 2);
+            return item + 1;
         }
-    }.callback).result(u32, arr);
+    }.callback).result(u32, init.arena.allocator(), arr);
+
+    for (res) |item| {
+        std.debug.print(":: {}\n", .{item});
+    }
 }
