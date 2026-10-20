@@ -9,19 +9,21 @@ const ActionTypes = enum {
     map,
     for_each,
     filter,
+    reduce,
 
     fn to_string(self: Self) []const u8 {
         return switch (self) {
             .map => constants.MAP_ACTION_NAME,
             .for_each => constants.FOR_EACH_ACTION_NAME,
             .filter => constants.FILTER_ACTION_NAME,
+            .reduce => constants.REDUCE_ACTION_NAME,
         };
     }
 
     fn requires_allocation(self: Self) bool {
         return switch (self) {
             .map, .filter => true,
-            .for_each => false,
+            .for_each, .reduce => false,
         };
     }
 
@@ -42,17 +44,27 @@ const ActionTypes = enum {
     fn allow_next_action(self: Self, next: Self) bool {
         return switch (self) {
             .map => switch (next) {
-                .map, .for_each, .filter => true,
+                .map, .for_each, .filter, .reduce => true,
             },
             .for_each => switch (next) {
-                .map, .for_each, .filter => false,
+                .map, .for_each, .filter, .reduce => false,
             },
             .filter => switch (next) {
-                .map, .for_each, .filter => true,
+                .map, .for_each, .filter, .reduce => true,
+            },
+            .reduce => switch (next) {
+                .map, .for_each, .filter, .reduce => false,
             },
         };
     }
 };
+
+fn ReduceDefaultValue(comptime T: type) type {
+    return union(enum) {
+        unset,
+        value: T,
+    };
+}
 
 pub fn ArrHandler(comptime T: type) type {
     return struct {
@@ -68,6 +80,13 @@ pub fn ArrHandler(comptime T: type) type {
 
         pub fn filter(comptime callback: fn (comptime T: type, T) bool) type {
             return ActionWrapper(action_description_from(T, callback, .filter, T));
+        }
+
+        pub fn reduce(
+            comptime Ret: type,
+            comptime callback: fn (comptime type, comptime T: type, acc: Ret, T) Ret,
+        ) type {
+            return ActionWrapper(action_description_from(T, callback, .reduce, T));
         }
     };
 }
@@ -105,10 +124,20 @@ fn action_description_from(
     );
 }
 
-fn get_action_result_type_single(comptime T: type) type {
+fn get_last_action_desc_action(comptime T: type) type {
+    const next_action = @FieldType(T, constants.NEXT_ACTION_FIELD_NAME);
+    if (next_action != @TypeOf(null)) {
+        return get_last_action_desc_action(@FieldType(T, constants.NEXT_ACTION_FIELD_NAME));
+    }
+
+    return @FieldType(T, "action");
+}
+
+fn get_action_result_ret_type_single(comptime T: type) type {
     const action_struct = @FieldType(T, constants.ACTION_FIELD_NAME);
     return if (@hasField(action_struct, constants.MAP_ACTION_NAME) or
-        @hasField(action_struct, constants.FILTER_ACTION_NAME))
+        @hasField(action_struct, constants.FILTER_ACTION_NAME) or
+        @hasField(action_struct, constants.REDUCE_ACTION_NAME))
         @FieldType(T, constants.RET_TYPE_FIELD_NAME)
     else
         void;
@@ -118,7 +147,7 @@ fn get_action_result_type(comptime T: type) type {
     const next_action = @FieldType(T, constants.NEXT_ACTION_FIELD_NAME);
     if (next_action != @TypeOf(null)) return get_action_result_type(next_action);
 
-    return get_action_result_type_single(T);
+    return get_action_result_ret_type_single(T);
 }
 
 fn get_action_fn_type(comptime T: type) type {
@@ -137,14 +166,14 @@ fn get_action_fn_type(comptime T: type) type {
     return @TypeOf(action_fn);
 }
 
-fn get_action_fn(comptime T: type) get_action_fn_type(T) {}
-
 inline fn handle_action_results(
     comptime T: type,
     comptime K: type,
+    comptime Acc: type,
     item: K,
+    acc: Acc,
 ) struct { get_action_result_type(T), bool } {
-    const res_type = get_action_result_type_single(T);
+    const res_type = get_action_result_ret_type_single(T);
     const res_value: res_type, const keep_item: bool = a: {
         const action_struct = @FieldType(T, constants.ACTION_FIELD_NAME);
         const inst: action_struct = .{};
@@ -162,6 +191,10 @@ inline fn handle_action_results(
             const action = @field(inst, constants.FILTER_ACTION_NAME);
             const keep_item = action(K, item);
             break :a .{ item, keep_item };
+        } else if (@hasField(action_struct, constants.REDUCE_ACTION_NAME)) {
+            const action = @field(inst, constants.REDUCE_ACTION_NAME);
+            const value = action(Acc, K, acc, item);
+            break :a .{ value, true };
         } else {
             @compileError("Expected a valid arr action");
         }
@@ -171,7 +204,7 @@ inline fn handle_action_results(
     if (!keep_item) return .{ undefined, keep_item };
     if (next_action == @TypeOf(null)) return .{ res_value, keep_item };
 
-    return handle_action_results(next_action, res_type, res_value);
+    return handle_action_results(next_action, res_type, Acc, res_value, acc);
 }
 
 fn append_to_action_impl(
@@ -200,11 +233,8 @@ fn append_to_action_impl(
             field_attributes[index] = .{};
             continue;
         } else if (std.mem.eql(u8, field.name, constants.ALLOCATES_FIELD_NAME)) {
-            if (field.type == @TypeOf(null) and @FieldType(
-                new_desc,
-                constants.ALLOCATES_FIELD_NAME,
-            ) != @TypeOf(null)) {
-                field_types[index] = bool;
+            if (@FieldType(new_desc, constants.ALLOCATES_FIELD_NAME) == @TypeOf(null)) {
+                field_types[index] = @TypeOf(null);
                 field_attributes[index] = .{};
                 continue;
             }
@@ -231,37 +261,79 @@ fn append_to_action(
     return ActionWrapper(desc);
 }
 
+fn get_result_type_or_slice(comptime T: type) type {
+    const res_type = get_action_result_type(T);
+    return if (@FieldType(T, constants.ALLOCATES_FIELD_NAME) != @TypeOf(null))
+        []res_type
+    else
+        res_type;
+}
+
+fn get_result_type_or_slice_and_error(comptime T: type) type {
+    const res_type = get_result_type_or_slice(T);
+    return if (@FieldType(T, constants.ALLOCATES_FIELD_NAME) != @TypeOf(null))
+        Allocator.Error!res_type
+    else
+        res_type;
+}
+
+fn desc_is_reduce(comptime T: type) bool {
+    const last_action_type = get_last_action_desc_action(T);
+    return @hasField(last_action_type, constants.REDUCE_ACTION_NAME);
+}
+
 fn ActionWrapper(comptime T: type) type {
     return struct {
         pub fn result(
             allocator: Allocator,
             data: []const @FieldType(T, constants.ORIGINAL_TYPE_FIELD_NAME),
-        ) a: {
+            reduce_default_value: ReduceDefaultValue(a: {
+                const res_type = get_action_result_type(T);
+                const is_reduce = desc_is_reduce(T);
+                if (is_reduce) break :a res_type;
+                break :a void;
+            }),
+        ) get_result_type_or_slice_and_error(T) {
             const res_type = get_action_result_type(T);
-            if (res_type == void) break :a void;
-            break :a !res_type;
-        } {
-            const res_type = get_action_result_type(T);
-            var result_buf: res_type = if (res_type == void)
+            const res_type_or_slice = get_result_type_or_slice(T);
+            const is_reduce = comptime desc_is_reduce(T);
+            const reduce_type = if (is_reduce) res_type else void;
+
+            var result_buf: res_type_or_slice = if (res_type == void or is_reduce)
                 undefined
             else
                 try allocator.alloc(res_type, data.len);
+
+            var reduce_value: reduce_type = if (is_reduce) reduce_default_value.value else undefined;
+
             var index: usize = 0;
             var was_filtered = false;
 
             for (data) |item| {
-                const start_type = get_action_result_type_single(T);
-                const res, const keep_item = handle_action_results(T, start_type, item);
+                const start_type = get_action_result_ret_type_single(T);
+                const res, const keep_item = handle_action_results(
+                    T,
+                    start_type,
+                    reduce_type,
+                    item,
+                    reduce_value,
+                );
                 if (!keep_item) {
                     was_filtered = true;
                     continue;
                 }
 
-                if (res_type != void) {
+                if (is_reduce) {
+                    reduce_value = res;
+                } else if (res_type != void) {
                     result_buf[index] = res;
                 }
 
                 index += 1;
+            }
+
+            if (is_reduce) {
+                return reduce_value;
             }
 
             if (res_type != void and was_filtered) {
@@ -291,6 +363,15 @@ fn ActionWrapper(comptime T: type) type {
             const current_res_type = get_action_result_type(T);
             const new_desc = action_description_from(current_res_type, callback, .filter, original_type);
             return append_to_action(T, new_desc, .filter, original_type);
+        }
+
+        pub fn reduce(
+            comptime Ret: type,
+            comptime callback: fn (comptime type, comptime T: type, acc: Ret, T) Ret,
+        ) type {
+            const original_type = @FieldType(T, constants.ORIGINAL_TYPE_FIELD_NAME);
+            const new_desc = action_description_from(Ret, callback, .reduce, original_type);
+            return append_to_action(T, new_desc, .reduce, original_type);
         }
     };
 }

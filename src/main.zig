@@ -7,7 +7,7 @@ var count: usize = 0;
 
 pub fn main(init: std.process.Init) !void {
     const arena_allocator = init.arena.allocator();
-    const arr_size = 2000000000;
+    const arr_size = 10;
     const arr = try arena_allocator.alloc(u32, arr_size);
 
     {
@@ -66,7 +66,40 @@ pub fn main(init: std.process.Init) !void {
 
     // try writer.print(":: {d}\n", .{count});
 
-    ArrHandler(u32)
+    // ---------------
+
+    // ArrHandler(u32)
+    //     .map(u32, struct {
+    //         fn callback(comptime Ret: type, comptime T: type, item: T) Ret {
+    //             return item + 1;
+    //         }
+    //     }.callback)
+    //     .map(u32, struct {
+    //         fn callback(comptime Ret: type, comptime T: type, item: T) Ret {
+    //             return item + 1;
+    //         }
+    //     }.callback)
+    //     .filter(struct {
+    //         fn callback(comptime T: type, item: T) bool {
+    //             return item % 2 == 0;
+    //         }
+    //     }.callback)
+    //     .map(u32, struct {
+    //         fn callback(comptime Ret: type, comptime T: type, item: T) Ret {
+    //             return item - 1;
+    //         }
+    //     }.callback)
+    //     .for_each(struct {
+    //         fn callback(comptime T: type, item: T) void {
+    //             std.debug.print(":: {}\n", .{item});
+    //             count += 1;
+    //         }
+    //     }.callback)
+    //     .result(init.gpa, arr);
+
+    // try writer.print(":: {d}\n", .{count});
+
+    const value = ArrHandler(u32)
         .map(u32, struct {
             fn callback(comptime Ret: type, comptime T: type, item: T) Ret {
                 return item + 1;
@@ -87,13 +120,12 @@ pub fn main(init: std.process.Init) !void {
                 return item - 1;
             }
         }.callback)
-        .for_each(struct {
-            fn callback(comptime T: type, item: T) void {
-                _ = item;
-                count += 1;
+        .reduce(u32, struct {
+            fn callback(comptime Ret: type, comptime T: type, acc: Ret, item: T) Ret {
+                return acc + item;
             }
         }.callback)
-        .result(init.gpa, arr);
+        .result(init.gpa, arr, .{ .value = 5 });
 
-    try writer.print(":: {d}\n", .{count});
+    std.debug.print(":: {}\n", .{value});
 }

@@ -7,3 +7,4 @@ pub const ORIGINAL_TYPE_FIELD_NAME = "original_type";
 pub const MAP_ACTION_NAME = "map";
 pub const FOR_EACH_ACTION_NAME = "for_each";
 pub const FILTER_ACTION_NAME = "filter";
+pub const REDUCE_ACTION_NAME = "reduce";
